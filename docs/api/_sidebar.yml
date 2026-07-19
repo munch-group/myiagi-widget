@@ -1,0 +1,13 @@
+website:
+  sidebar:
+  - contents:
+    - api/index.qmd
+    - contents:
+      - api/run.qmd
+      section: Game
+    - contents:
+      - api/get_expression.qmd
+      - api/randomExpression.qmd
+      section: Expression generator
+    id: api
+  - id: dummy-sidebar

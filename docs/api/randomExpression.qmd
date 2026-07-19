@@ -1,0 +1,8 @@
+# randomExpression { #myiagi_widget.expressions.randomExpression }
+
+```python
+myiagi_widget.expressions.randomExpression(prob, leaf_prob, topic_probs)
+```
+
+Retry ``_randomExpression`` until it yields a syntactically valid,
+evaluable expression -- to make sure all sub expressions are valid.

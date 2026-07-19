@@ -1,0 +1,11 @@
+# get_expression { #myiagi_widget.expressions.get_expression }
+
+```python
+myiagi_widget.expressions.get_expression(prob, leaf_prob, topic_probs)
+```
+
+Build a random expression tree and stringify it.
+
+``prob``/``leaf_prob``/``topic_probs`` come from ``controls.py``'s
+per-course-week difficulty ramp -- see ``app.py``'s ``next_expression()``
+for how the result is fed to ``steps_widget.steps._steps()``.

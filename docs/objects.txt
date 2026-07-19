@@ -1,0 +1,7 @@
+# Sphinx inventory version 2
+# Project: myiagi-widget
+# Version: 0.0.9999
+# The remainder of this file is compressed using zlib.
+myiagi_widget.app.run py:function 1 api/run.html#myiagi_widget.app.run -
+myiagi_widget.expressions.get_expression py:function 1 api/get_expression.html#myiagi_widget.expressions.get_expression -
+myiagi_widget.expressions.randomExpression py:function 1 api/randomExpression.html#myiagi_widget.expressions.randomExpression -

@@ -1,0 +1,20 @@
+# Function reference {.doc .doc-index}
+
+## Game
+
+The `textual` App and the `myiagi` console-script entry point.
+
+
+| | |
+| --- | --- |
+| [run](run.qmd#myiagi_widget.app.run) | Parse CLI args, load/init the persisted progress file, and launch the game. |
+
+## Expression generator
+
+Builds the random Python expression each round is generated from.
+
+
+| | |
+| --- | --- |
+| [get_expression](get_expression.qmd#myiagi_widget.expressions.get_expression) | Build a random expression tree and stringify it. |
+| [randomExpression](randomExpression.qmd#myiagi_widget.expressions.randomExpression) | Retry ``_randomExpression`` until it yields a syntactically valid, |

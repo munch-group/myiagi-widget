@@ -1,0 +1,9 @@
+# run { #myiagi_widget.app.run }
+
+```python
+myiagi_widget.app.run()
+```
+
+Parse CLI args, load/init the persisted progress file, and launch the game.
+
+This is the ``myiagi`` console-script entry point.

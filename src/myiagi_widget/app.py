@@ -1,0 +1,466 @@
+"""myiagi -- reorder shuffled evaluation steps back into the correct order.
+
+A ``textual`` TUI ("Wax On - Wax Off" / "STEPS OF DOOM") where the student
+reorders the shuffled evaluation steps of a randomly generated expression back
+into the correct order, with persistent per-course-week scoring. Ported from
+bp-help's ``text_gui.py``, with the stepper engine (``_steps``) now coming
+from ``steps_widget`` instead of being ``exec()``'d from a vendored copy.
+"""
+
+import re
+import os
+import random
+import pickle
+import datetime
+import time
+import argparse
+import locale
+from collections import defaultdict
+from itertools import groupby
+from operator import itemgetter
+
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical
+from textual.widgets import Static, RichLog, DataTable
+from textual.screen import Screen
+from textual import events
+from textual.message import Message
+
+from rich.align import Align
+from rich.text import Text
+from rich.style import Style as RichStyle
+
+from art import text2art
+
+from pygments import highlight
+from pygments.style import Style
+from pygments.token import Token
+from pygments.lexers import Python3Lexer
+from pygments.formatters import BBCodeFormatter
+
+from steps_widget.steps import _steps
+
+from .controls import (
+    course_week_nr, leaf_prob, min_steps, max_steps, max_expr_len,
+    topic_probs, score_multiplier, score_goals, praise, encouragement,
+    course_start_week, vacation_week, day_delta,
+)
+from .expressions import get_expression
+
+locale.setlocale(locale.LC_ALL, '')  # Use '' for auto, or force e.g. to 'en_US.UTF-8'
+
+progress = None
+
+
+class MyStyle(Style):
+        styles = {
+            Token.String:     'ansigreen',
+            Token.Number:     'ansiblue',
+            Token.Keyword: 'ansired',
+            Token.Literal: 'ansiyellow',
+            Token.Operator: 'ansibrightblue',
+            Token.Text: 'ansibrightred',
+            Token.Token: 'ansibrightcyan',
+            Token.Name: 'ansigray',
+            Token.Other: 'ansicyan',
+            Token.Generic: 'ansiblack'
+        }
+
+
+def highlight_code(code):
+    s = highlight(code, Python3Lexer(), BBCodeFormatter(style=MyStyle))
+    color = '#ffffff'
+    s = re.sub(fr'\[color={color}\](\s+?)\[/color\]', r'\1', s)
+    for color, repl in [('#007f00', 'red3'), ('#0000ff', 'black'), ('#7f0000', 'dark_magenta'), ('#00007f', 'dark_goldenrod')]:
+        s = re.sub(fr'color={color}(\].*?\[/)color', fr'{repl}\1{repl}', s)
+    return s
+
+
+def sparkline_bars(data):
+    BARS = u' ▁▂▃▄▅▆▇█'
+    if sum(data) == 0:
+        return ''
+
+    from statistics import mean, variance
+    from math import sqrt
+    cv = sqrt(variance(data)) / mean(data)
+    gold, silver, bronse = u'🥇', u'🥈', u'🥉'
+    if cv < 0.3:
+        medal = gold
+    elif cv < 0.4:
+        medal = silver
+    elif cv < 0.5:
+        medal = bronse
+    else:
+        medal = ''
+
+    data = [(len(BARS) - 1) * n / max(data) for n in data]
+    incr = min(data)
+    width = (max(data) - min(data)) / (len(BARS) - 1)
+    bins = [i * width + incr for i in range(len(BARS))]
+    indexes = []
+    for n in data:
+        for i, thres in enumerate(bins):
+            if thres <= n < thres + width:
+                indexes.append(i)
+                break
+    sparkline = ''.join(BARS[i] for i in indexes) + medal
+    return sparkline
+
+
+def streak_stars(streaks, weeknr, current=False):
+
+    tot_steak = sum(streaks.values())
+    begin, end, badge = '', '', ''
+    if tot_steak > 2 * 7:
+        begin = '[red]'
+        end = '[/red]'
+
+    if tot_steak > 7 * 7 and weeknr == course_week_nr:
+        badge = '🥇'
+
+    stars = '★' * streaks[weeknr]
+    if current:
+        return f'|{begin}{stars:<7}{end}|{badge}'
+    else:
+        return f'|{begin}{stars:>7}{end}|{badge}'
+
+
+class KeyLogger(RichLog):
+
+    class Updated(Message):
+        """Update data table message."""
+
+        def __init__(self):
+            super().__init__()
+
+    def __init__(self, markup=True):
+        super().__init__(markup=markup)
+
+    def on_mount(self):
+        self.next_expression()
+
+    def on_key(self, event: events.Key):
+        if not self.is_correct and event.key.isdigit():
+            line_num = int(event.key)
+            if line_num <= len(self.steps_list):
+                self.attempts += 1
+                self.clear()
+                self.focal = line_num
+                self.write_steps()
+        elif not self.is_correct and event.key == 'n':
+            self.next_expression()
+        elif event.key == 'enter':
+            self.next_expression()
+
+    def key_up(self):
+        if not self.is_correct and self.focal is not None and self.focal > 1:
+            i = self.focal - 1
+            self.steps_list[i], self.steps_list[i - 1] = self.steps_list[i - 1], self.steps_list[i]
+            self.focal -= 1
+            self.clear()
+            self.write_steps()
+            if self.is_correct_order():
+                self.write('\nPress Enter to get next one or Ctrl-C to quit')
+
+    def key_down(self):
+        if not self.is_correct and self.focal is not None and self.focal < len(self.steps_list):
+            i = self.focal - 1
+            self.steps_list[i], self.steps_list[i + 1] = self.steps_list[i + 1], self.steps_list[i]
+            self.focal += 1
+            self.clear()
+            self.write_steps()
+            if self.is_correct_order():
+                self.write('\nPress Enter to get next one or Ctrl-C to quit')
+
+    def is_correct_order(self):
+        self.is_correct = all(x == y for x, y in zip(self.steps_list, self.correct_order))
+        if self.is_correct:
+            # update progress
+            score = course_week_nr * len(self.steps_list) / (self.attempts + 1)
+            progress['scores'].append((score, (datetime.datetime.now() + datetime.timedelta(days=day_delta))))
+            progress['current_score'] = sum(score_multiplier * s * 0.9 ** ((time.time() - datetime.datetime.timestamp(t)) / (60 * 60 * 24)) for (s, t) in progress['scores']) / score_multiplier
+            progress['highscores'][course_week_nr] = progress['current_score']
+
+            with open(pickle_file_name, 'wb') as pickle_file:
+                pickle.dump(progress, pickle_file)
+
+            self.write(f'CORRECT! You did it in {self.attempts} swaps and earned {int(score*score_multiplier)} points')
+
+            self.post_message(self.Updated())
+
+        return self.is_correct
+
+    def write_steps(self):
+
+        lst = []
+        for (i, s) in enumerate(self.steps_list):
+            if i + 1 == self.focal:
+                lst.append(f'[red][bold]{i+1:>2}[/bold][/red]   ' + highlight_code(s))
+            else:
+                lst.append(f'{i+1:>2}   ' + highlight_code(s))
+        self.write(''.join(lst))
+
+    def next_expression(self):
+        self.clear()
+        self.focal = None
+        self.attempts = 0
+        self.is_correct = False
+
+        steps_list = []
+        for _ in range(1000):
+            expr = get_expression(1, leaf_prob=leaf_prob, topic_probs=topic_probs)
+            try:
+                steps_list = _steps(expr)
+            except Exception:
+                # TODO: make it more robust instead of catching exceptions...
+                continue
+            if not (len(steps_list) < min_steps or len(steps_list) > max_steps or any(len(x) > max_expr_len for x in steps_list)):
+                break
+
+        self.correct_order = steps_list[:]
+        for _ in range(100):
+            random.shuffle(steps_list)
+            if not all(x == y for x, y in zip(steps_list, self.correct_order)):
+                break
+
+        self.steps_list = steps_list
+        self.write_steps()
+
+
+def format_score(score: float, current: bool = False) -> float:
+    if current:
+        style = RichStyle(bold=True, blink=True)
+        score = Text(str(score), style=style, justify='right')
+    else:
+        score = Text(str(score), justify='right')
+    return score
+
+
+def format_score_goal() -> str:
+    score_goal = score_goals[course_week_nr]
+    missing_points = int(score_goal - progress['current_score'] * score_multiplier)
+    if missing_points < 0:
+        return f"[bold]This week's score goal: {score_goal:>10}[/bold]\n" f"[green]You are ahead by:      {-missing_points:>10}[/green]\n\n" f"[bold]{next(praise).upper()}![/bold]"
+    else:
+        return f"[bold]This week's score goal: {score_goal:>10}[/bold]\n" f"[red]You still need to earn: {missing_points:>10}[/red]\n\n" f"[bold]{next(encouragement).upper()}![/bold]"
+
+
+def compute_streaks() -> dict:
+    working_days = defaultdict(list)
+    for score, date in progress['scores']:
+        weeknr = date.isocalendar().week - course_start_week + 1
+        weeknr = max(1, weeknr)
+        weekday = date.weekday() + 1
+        working_days[weeknr].append(weekday)
+
+    for weeknr in working_days:
+        working_days[weeknr] = sorted(set(working_days[weeknr]))
+
+    def conseq(args):
+        i, x = args
+        return i - x
+
+    streaks = defaultdict(int)
+    for weeknr in range(course_week_nr, 0, -1):
+        days = sorted(working_days[weeknr])
+        conseq_days = []
+        for d, g in groupby(enumerate(days), conseq):
+            conseq_days = list(map(itemgetter(1), g))
+            if weeknr == course_week_nr:
+                if (datetime.date.today() + datetime.timedelta(days=day_delta)).weekday() + 1 in conseq_days:
+                    break
+            elif 7 in conseq_days:
+                break
+        if weeknr == vacation_week:
+            conseq_days = [1, 2, 3, 4, 5, 6, 7]
+
+        streak = len(conseq_days)
+        streaks[weeknr] = streak
+
+        if 1 not in conseq_days:
+            break
+
+    return streaks
+
+
+def compute_effort() -> dict:
+    problems_solved = defaultdict(list)
+    for score, date in progress['scores']:
+        weeknr = date.isocalendar().week - course_start_week + 1
+        weeknr = max(1, weeknr)
+        weekday = date.weekday() + 1
+        problems_solved[weeknr].append(weekday)
+
+    effort = {}
+    for weeknr in range(1, 16):
+        effort[weeknr] = [problems_solved[weeknr].count(d) for d in range(1, 8)]
+
+    return effort
+
+
+class PlayerStats(DataTable):
+
+    def on_mount(self):
+
+        streaks = compute_streaks()
+
+        effort = compute_effort()
+
+        rows = [("", "Stamina", " Streak", "Score", "Trophies"), ]
+        for weeknr in range(1, 16):
+
+            score = int(progress['highscores'][weeknr] * score_multiplier)
+
+            if weeknr <= course_week_nr and score >= score_goals[weeknr]:
+                trophy = '🏆'
+            else:
+                trophy = ''
+
+            if weeknr > course_week_nr:
+                score = ''
+
+            if weeknr == course_week_nr:
+                score = format_score(score, current=True)
+            else:
+                score = format_score(score)
+
+            if weeknr <= course_week_nr:
+                sparkline = sparkline_bars(effort[weeknr])
+            else:
+                sparkline = ''
+
+            if weeknr <= course_week_nr:
+                if weeknr == course_week_nr:
+                    stars = streak_stars(streaks, weeknr, current=True)
+                else:
+                    stars = streak_stars(streaks, weeknr)
+            else:
+                stars = ''
+
+            if weeknr <= course_week_nr:
+                if weeknr == vacation_week:
+                    weeknr, sparkline, score, trophy = '-', 'VACATION', '--------', ''
+                elif weeknr > vacation_week:
+                    weeknr -= 1
+
+            rows.append((weeknr,
+                        sparkline,
+                        stars,
+                        score,
+                        trophy
+            ))
+
+        header_style = RichStyle(color='bright_white', bold=False, blink=False)
+        styled_header = [
+            Text(str(cell), style=header_style, justify='left') for cell in rows[0]
+        ]
+        self.add_columns(*styled_header)
+        self.add_rows(rows[1:])
+        self.show_cursor = False
+        self.zebra_stripes = True
+
+
+class STEPS(Screen):
+    BINDINGS = [("h", "app.pop_screen", "Pop screen")]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="header"):
+            text = text2art("WAX ON - WAX OFF", font="tarty3")
+            head = Align(f'{text}', align='center', vertical='middle')
+            yield Static(head)
+        with Container(id="app-grid"):
+            with Vertical(id="left-pane"):
+                yield KeyLogger()
+            with Horizontal(id="top-right"):
+                self.player_stats = PlayerStats()
+                yield self.player_stats
+            with Horizontal(id="bottom-right"):
+                s = format_score_goal()
+                self.message_panel = Static(s)
+                yield self.message_panel
+
+
+class STEPSApp(App):
+    CSS_PATH = "app.css"
+    dark = False
+    BINDINGS = [("escape", "show_steps", "STEPS")]
+
+    def on_mount(self) -> None:
+        self.steps_screen = STEPS()
+        self.push_screen(self.steps_screen)
+
+    def action_show_steps(self) -> None:
+        self.push_screen(self.steps_screen)
+
+    def on_key_logger_updated(self):
+        score = int(progress['current_score'] * score_multiplier)
+
+        streaks = compute_streaks()
+        effort = compute_effort()
+
+        self.steps_screen.player_stats.update_cell_at((course_week_nr - 1, 1),
+                                                          sparkline_bars(effort[course_week_nr]))
+
+        self.steps_screen.player_stats.update_cell_at((course_week_nr - 1, 2),
+                                                          streak_stars(streaks, course_week_nr, current=True))
+        self.steps_screen.player_stats.update_cell_at((course_week_nr - 1, 3),
+                                                          format_score(score, current=True))
+        self.steps_screen.player_stats.update_cell_at((course_week_nr - 1, 4),
+                                                          '🏆' if score >= score_goals[course_week_nr] else '')
+
+        self.steps_screen.message_panel.update(format_score_goal())
+
+
+def run():
+    """Parse CLI args, load/init the persisted progress file, and launch the game.
+
+    This is the ``myiagi`` console-script entry point.
+    """
+
+    global course_week_nr, progress, pickle_file_name, score_goals, day_delta
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Reorder the shuffled evaluation steps of a randomly generated "
+                     "Python expression back into the correct order.",
+    )
+    parser.add_argument('-w',
+                    dest="course_week_nr",
+                    type=int,
+                    default=None,
+                    help='Course week number.')
+    parser.add_argument('-d',
+                    dest='day_delta',
+                    type=int,
+                    default=None,
+                    help="Number of days before weekday.")
+
+    args = parser.parse_args()
+
+    if args.course_week_nr is not None:
+        day_delta = (args.course_week_nr - course_week_nr) * 7
+        course_week_nr = args.course_week_nr
+    if args.day_delta is not None:
+        day_delta += args.day_delta
+
+    pickle_file_name = os.path.join(os.path.expanduser('~'), '.myiagi_progress.pkl')
+
+    if os.path.exists(pickle_file_name):
+        with open(pickle_file_name, 'rb') as pickle_file:
+            progress = pickle.load(pickle_file)
+    else:
+        progress = {'scores': [], 'current_score': 0,
+                    'highscores': dict([(w, 0) for w in range(1, 16)])}
+
+    progress['current_score'] = sum(score_multiplier * s * 0.9 ** ((time.time() - datetime.datetime.timestamp(t)) / (60 * 60 * 24)) for (s, t) in progress['scores']) / score_multiplier
+    progress['highscores'][course_week_nr] = progress['current_score']
+
+    app = STEPSApp()
+    app.run()
+
+
+if __name__ == "__main__":
+
+    app = STEPSApp()
+    app.run()
