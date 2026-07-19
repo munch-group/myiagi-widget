@@ -76,7 +76,7 @@ format:
       theme: neutral 
 
 quartodoc:
-  package: myiagi-widget
+  package: myiagi_widget
   style: pkgdown
   dir: api
   render_interlinks: true
