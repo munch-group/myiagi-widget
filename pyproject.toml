@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "myiagi-widget"
-version = "0.1.0"
+version = "0.1.1"
 description = "Terminal trainer game where students reorder the shuffled evaluation steps of a random Python expression back into the correct order"
 authors = [
     {name = "Kasper Munch", email = "kaspermunch@birc.au.dk"}
